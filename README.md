@@ -122,3 +122,34 @@ submission checklist in the assignment before handing in your repository.
 The script exits non-zero when unit or integration tests fail, a rollout does not become ready, or `scripts/smoke_test.py` fails. With `DOCKER_REGISTRY` unset, the push stage records the immutable tag and the deploy stage loads it into the kind node. A Jenkins agent that should push to a remote registry sets `DOCKER_REGISTRY` and logs in with credential id `docker-registry`.
 
 The agent needs Git, Python 3.12, Docker with Compose, kind, kubectl, openssl, and network access to pull base images. It also needs a Docker socket and permission to create a local kind cluster. No cloud credentials are required.
+
+## Operations
+
+```text
+Client :8080 -> ingress-nginx /jobs
+             -> api:8000 (2 replicas) -> rabbitmq:5672 -> worker:8001 -> mock:8081/infer
+                       |                        |
+                       +-------- redis:6379 -----+
+```
+
+Bring the cluster up with `scripts/cluster-up.sh`, then `scripts/deploy.sh`. Remove it with `scripts/cleanup.sh`. Job traffic is `http://127.0.0.1:8080/jobs`. RabbitMQ, Redis, the mock, the worker, and `/livez`, `/readyz`, and `/metrics` stay on ClusterIP. Ingress checks on 24 Sep 2026 returned nginx 404 for those operational paths and the API JSON body `{"detail":"job not found"}` for an unknown job id.
+
+Liveness is `/livez`. Readiness is `/readyz`. Startup uses `/livez`, so a slow broker does not crash the process. `terminationGracePeriodSeconds` is 30, above the worker's 20-second drain. API and worker set `enableServiceLinks: false`. API starts at 2 replicas with `maxUnavailable: 0`. The worker starts at 1. Redis and RabbitMQ are single-replica Deployments with `emptyDir` and Redis AOF. That survives a container restart only while the pod stays on the node. It is not a backup or a highly available broker.
+
+### Networking and security
+
+`deploy/kustomize/networkpolicy.yaml` is default-deny plus allows: ingress-nginx to the API, the API and worker to RabbitMQ and Redis, and the worker to the mock. DNS egress to `kube-system` is included so the same rules can work on an enforcing CNI. kind's CNI is kindnet. `scripts/check-network.sh` applied the policies and a pod labeled `netcheck` still opened TCP to Redis (`REDIS_REACHABLE`, phase Succeeded). The objects exist and are not enforced here. An enforcing CNI such as Calico or Cilium would make that connection fail. Kubelet probes are node traffic; on an enforcing CNI, confirm probes still reach `/livez` before relying on the policies.
+
+Credentials are generated into the `app-credentials` Secret by `scripts/deploy.sh` and are not stored in git. `secret.example.yaml` shows the key names only. Application containers run as uid 10001 with a read-only root filesystem. Redis runs as uid 999. The RabbitMQ image starts as root so it can drop to the `rabbitmq` user. The API is unauthenticated. A production ingress would terminate TLS, require authentication, and restrict source networks. A real inference provider would be reached through an allow-listed egress proxy, with an idempotency key, because delivery is at least once.
+
+### Observability
+
+`scripts/observe.sh` installs metrics-server on first use (kind needs `--kubelet-insecure-tls`) and prints pod state, `kubectl top pods`, API and worker Prometheus series, `rabbitmqctl list_queues`, and recent JSON logs. A local run showed both API replicas and the worker under 50Mi, RabbitMQ at 129m CPU and 93Mi, `worker_consumer_connected 1`, `worker_jobs_in_progress 0`, and queue `jobs` at 0 ready and 0 unacknowledged. Worker logs for job `f021a396-741b-4d45-92f6-92f3d8d0943c` were `job_started` then `job_finished` with `status=succeeded`. Counters reset on process restart; use rates. API latency is handler time, not queue-to-result time. Queue age, not CPU, is the useful worker scale signal.
+
+### Resilience
+
+`scripts/resilience.sh` deleted the worker pod, waited for the replacement, and the smoke test passed (`e8c9b1ba-9978-4afe-8e06-2ef5a519623b`). It then scaled the worker to 2 replicas and the smoke test passed again (`e0ae037d-85b4-4133-970d-cdc8dbc03a69`). The script scales back to 1 so the cluster matches the manifest. Retries on transport errors, HTTP 429, and 5xx stop at `EXTERNAL_MAX_ATTEMPTS` (3). `MOCK_MODE=unavailable` ends new jobs as `failed` / `external_unavailable` while mock `/livez` stays 200. A bad image tag fails `kubectl rollout status`, which fails `scripts/deploy.sh` and the pipeline. Rollback of a pushed SHA is `kubectl rollout undo deployment/api -n takehome`.
+
+### Production follow-ups
+
+API CPU autoscaling would track the wrong signal for this I/O-bound service. Scale workers from queue depth or age. Redis and RabbitMQ need replicated disks, backups, and a restore drill before they are highly available. Publish and the Redis write are not one transaction, and a crash after the mock call can repeat work. Terminal state expires with `RESULT_TTL_SECONDS`. Malformed messages are dropped with no dead-letter queue. Those stay application limits; this deployment does not change them.
