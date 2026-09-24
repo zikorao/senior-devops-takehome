@@ -5,6 +5,8 @@ set -euo pipefail
 NS=takehome
 kubectl config use-context kind-takehome >/dev/null
 kubectl apply -k "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/deploy/kustomize" >/dev/null
+# kindnet programs policies shortly after they are created.
+sleep 8
 
 echo "== NetworkPolicy objects =="
 kubectl -n "$NS" get networkpolicy

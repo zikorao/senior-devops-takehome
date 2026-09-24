@@ -1,3 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rabbitmq-plugins
+  labels:
+    app.kubernetes.io/name: rabbitmq
+    app.kubernetes.io/part-of: takehome
+data:
+  enabled_plugins: |
+    [rabbitmq_management,rabbitmq_prometheus].
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -15,6 +26,10 @@ spec:
       labels:
         app.kubernetes.io/name: rabbitmq
         app.kubernetes.io/part-of: takehome
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "15692"
+        prometheus.io/path: "/metrics"
     spec:
       enableServiceLinks: false
       automountServiceAccountToken: false
@@ -27,6 +42,8 @@ spec:
               containerPort: 5672
             - name: management
               containerPort: 15672
+            - name: prometheus
+              containerPort: 15692
           env:
             - name: RABBITMQ_DEFAULT_USER
               valueFrom:
@@ -65,9 +82,15 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/rabbitmq
+            - name: plugins
+              mountPath: /etc/rabbitmq/enabled_plugins
+              subPath: enabled_plugins
       volumes:
         - name: data
           emptyDir: {}
+        - name: plugins
+          configMap:
+            name: rabbitmq-plugins
 ---
 apiVersion: v1
 kind: Service
@@ -87,3 +110,6 @@ spec:
     - name: management
       port: 15672
       targetPort: management
+    - name: prometheus
+      port: 15692
+      targetPort: prometheus

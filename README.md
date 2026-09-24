@@ -138,13 +138,21 @@ Liveness is `/livez`. Readiness is `/readyz`. Startup uses `/livez`, so a slow b
 
 ### Networking and security
 
-`deploy/kustomize/networkpolicy.yaml` is default-deny plus allows: ingress-nginx to the API, the API and worker to RabbitMQ and Redis, and the worker to the mock. DNS egress to `kube-system` is included so the same rules can work on an enforcing CNI. kind's CNI is kindnet. `scripts/check-network.sh` applied the policies and a pod labeled `netcheck` still opened TCP to Redis (`REDIS_REACHABLE`, phase Succeeded). The objects exist and are not enforced here. An enforcing CNI such as Calico or Cilium would make that connection fail. Kubelet probes are node traffic; on an enforcing CNI, confirm probes still reach `/livez` before relying on the policies.
+`deploy/kustomize/networkpolicy.yaml` is default-deny plus allows: ingress-nginx and Prometheus to the API, the API and worker to RabbitMQ and Redis, the worker to the mock, and Prometheus to the metrics ports. DNS egress to `kube-system` is included. kind's CNI is kindnet, and on this cluster it enforces the policies after a short delay. `scripts/check-network.sh` waits, then starts a pod labeled `netcheck`. That pod timed out connecting to Redis, while the API, which is allowed, still can. Kubelet probes are node traffic and the smoke test still passes through ingress.
 
 Credentials are generated into the `app-credentials` Secret by `scripts/deploy.sh` and are not stored in git. `secret.example.yaml` shows the key names only. Application containers run as uid 10001 with a read-only root filesystem. Redis runs as uid 999. The RabbitMQ image starts as root so it can drop to the `rabbitmq` user. The API is unauthenticated. A production ingress would terminate TLS, require authentication, and restrict source networks. A real inference provider would be reached through an allow-listed egress proxy, with an idempotency key, because delivery is at least once.
 
 ### Observability
 
-`scripts/observe.sh` installs metrics-server on first use (kind needs `--kubelet-insecure-tls`) and prints pod state, `kubectl top pods`, API and worker Prometheus series, `rabbitmqctl list_queues`, and recent JSON logs. A local run showed both API replicas and the worker under 50Mi, RabbitMQ at 129m CPU and 93Mi, `worker_consumer_connected 1`, `worker_jobs_in_progress 0`, and queue `jobs` at 0 ready and 0 unacknowledged. Worker logs for job `f021a396-741b-4d45-92f6-92f3d8d0943c` were `job_started` then `job_finished` with `status=succeeded`. Counters reset on process restart; use rates. API latency is handler time, not queue-to-result time. Queue age, not CPU, is the useful worker scale signal.
+`scripts/observe.sh` is the command-line health view. It installs metrics-server on first use (kind needs `--kubelet-insecure-tls`) and prints pod state, `kubectl top pods`, API and worker series, `rabbitmqctl list_queues`, and recent JSON logs. A local run showed both API replicas and the worker under 50Mi, RabbitMQ at 129m CPU and 93Mi, `worker_consumer_connected 1`, `worker_jobs_in_progress 0`, and queue `jobs` at 0 ready and 0 unacknowledged. Worker logs for job `f021a396-741b-4d45-92f6-92f3d8d0943c` were `job_started` then `job_finished` with `status=succeeded`.
+
+Prometheus and Grafana are internal. They are not on the ingress. Prometheus scrapes each API and worker pod at `/metrics` and RabbitMQ’s Prometheus plugin on port 15692, so both API replicas are included. Grafana provisions a Prometheus datasource and the Takehome jobs dashboard: request rate, 5xx ratio, handler-latency p95, worker completions, consumer connection, jobs in progress, and queue depth. Anonymous view access is enabled for this local exercise.
+
+```sh
+kubectl -n takehome port-forward svc/grafana 3000:3000
+```
+
+Open `http://127.0.0.1:3000` and the dashboard Takehome / Takehome jobs. CPU and memory stay on `kubectl top` in `scripts/observe.sh`. Logs stay on `kubectl logs`. Counters reset on process restart; the dashboard uses `rate`. API latency is handler time, not queue-to-result time. Queue age, not CPU, is the useful worker scale signal.
 
 ### Resilience
 
@@ -154,9 +162,9 @@ Credentials are generated into the `app-credentials` Secret by `scripts/deploy.s
 
 Timed implementation on 24 Sep 2026 was about 45 minutes, from the API and worker images through this note (roughly 13:25–14:05 America/Toronto). Tool installs and the first Compose test were before that clock. Work stopped under the four-hour cap.
 
-Completed: API and worker images, kind deploy, ingress limited to `/jobs`, GitHub Actions pipeline (Jenkinsfile is the same script), observability, worker restart and scale, and a kindnet check showing NetworkPolicy is not enforced.
+Completed: API and worker images, kind deploy, ingress limited to `/jobs`, GitHub Actions pipeline (Jenkinsfile is the same script), Prometheus and Grafana, worker restart and scale, and a check that NetworkPolicy is enforced.
 
-Next, if more time were available: an enforcing CNI, queue-based worker scaling, and durable Redis and RabbitMQ.
+Next, if more time were available: queue-based worker scaling, and durable Redis and RabbitMQ.
 
 ### Production follow-ups
 

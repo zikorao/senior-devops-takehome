@@ -11,3 +11,5 @@ resources:
   - worker.yaml
   - ingress.yaml
   - networkpolicy.yaml
+  - prometheus.yaml
+  - grafana.yaml
