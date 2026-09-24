@@ -63,6 +63,19 @@ stage_deploy() {
 }
 
 stage_smoke() {
+  local attempt code
+  for attempt in $(seq 1 30); do
+    code="$(curl -sS -o /dev/null -w '%{http_code}' \
+      -H 'Content-Type: application/json' \
+      -d '{"prompt":" "}' \
+      "${API_BASE_URL}/jobs" || true)"
+    if [[ "$code" == "422" ]]; then
+      echo "Ingress is serving /jobs"
+      break
+    fi
+    echo "Waiting for ingress /jobs (attempt ${attempt}, HTTP ${code})"
+    sleep 2
+  done
   "$ROOT/.venv/bin/python" "$ROOT/scripts/smoke_test.py" --base-url "$API_BASE_URL"
 }
 
