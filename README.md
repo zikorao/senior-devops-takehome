@@ -184,9 +184,9 @@ State is local, at `deploy/terraform/terraform.tfstate`. It contains the generat
 
 ### Time
 
-Timed implementation on 24 Sep 2026 was about 45 minutes, from the API and worker images through this note (roughly 13:25–14:05 America/Toronto). Tool installs and the first Compose test were before that clock. Work stopped under the four-hour cap.
+Timed implementation on 24 Sep 2026 was about 2 hours, from the API and worker images through the queue scaler (roughly 13:25–15:20 America/Toronto). Tool installs and the first Compose test were before that clock. Work stayed under the four-hour cap.
 
-Completed in that window: API and worker images, kind deploy, ingress limited to `/jobs`, GitHub Actions pipeline (Jenkinsfile is the same script), Prometheus and Grafana, worker restart and scale, and a check that NetworkPolicy is enforced. Terraform, queue-based worker scaling, hostPath disks, alerts, the local registry, and the failure drills were added after that timed window.
+Completed: API and worker images, kind deploy, ingress limited to `/jobs`, GitHub Actions pipeline (Jenkinsfile is the same script), Prometheus and Grafana, a check that NetworkPolicy is enforced, worker restart, Terraform recreate and remove, hostPath disks, queue-based worker scaling, alerts, the local registry, and the failure drills.
 
 Next, if more time were available: a second kind node so Redis and RabbitMQ can fail off this node, and a backup copied off the node disk.
 
