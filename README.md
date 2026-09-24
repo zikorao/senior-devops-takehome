@@ -153,21 +153,67 @@ Queue depth drives worker replicas because the worker is bound by the mock call,
 
 The push stage publishes the immutable tag to a local registry on `127.0.0.1:5001` when `DOCKER_REGISTRY` is unset. Deploy still loads the image into the kind node. The node is not a registry mirror. A Jenkins agent with a real registry sets `DOCKER_REGISTRY` and uses credential id `docker-registry`.
 
-### Proposed improvements
+### Discussion
 
-These are not deployed. They are the production shape of the same design.
+The assignment lists these as discussion topics. Queue-driven worker scaling, NetworkPolicy enforcement, pod-level persistence, and API rollback are implemented and were exercised. API HPA, internet egress, production TLS and identity, a highly available broker and Redis, and off-node backup are discussed here and are not deployed. Nothing below assumes a cloud account.
 
-**Edge.** Terminate TLS on the ingress, require authentication, and restrict source networks. The current API is open on loopback so the supplied smoke test can call it.
+#### API HPA
 
-**Real egress.** The mock is an in-cluster stand-in. A real inference provider would be a separate hostname, reached through an allow-listed egress proxy, with an idempotency key on the provider call. Internet egress is not required for the local mock, and the NetworkPolicy does not grant it. Pods have no general outbound allow.
+**Proposed.** The API Deployment stays at 2 replicas with `maxUnavailable: 0` and `maxSurge: 1`. That is enough for a rolling update to keep `/jobs` serving on a laptop, and it does not require metrics-server to be healthy before the API can run. `scripts/observe.sh` can install metrics-server for `kubectl top`, which would be enough to feed a CPU HorizontalPodAutoscaler. A CPU target would still be the wrong signal. The API validates a small JSON body, writes Redis, and waits for a publisher confirm. A local run showed the API pods under 50Mi, and the work is waiting on the broker and Redis. CPU would sit near the request and the autoscaler would stay at its minimum while accept latency grew.
 
-**Exactly-once submission and execution.** Delivery is at least once. Redis and the publish are not one transaction, so a publish timeout can leave an orphan `queued` record or a 503 after the broker accepted the message. A crash after the mock returns and before the Redis write can repeat the external call. An outbox plus a submission idempotency contract would close the first gap. A provider idempotency key would close the second. Terminal state expires after `RESULT_TTL_SECONDS`, so a message that outlives its Redis record can run again.
+If traffic warranted autoscaling, the metric would be request rate or in-flight accepts from `api_http_requests_total`, with a minimum of 2 so a rollout can still surge. The worker must not share that autoscaler. Its concurrency is one message per replica, and the backlog lives in RabbitMQ.
 
-**Poison messages.** Malformed messages are rejected without requeue. There is no dead-letter queue. A permanently unavailable dependency becomes `failed` after three attempts and is not retried forever.
+#### Queue-driven worker scaling
 
-**State.** A second kind node, with the data volumes able to move, would let Redis and RabbitMQ survive loss of this node. A backup copied off the node disk would survive deletion of the cluster. Quorum queues and a Redis replica are the availability step after that. A successful Redis reply here is not an fsync or a failover claim.
+**Implemented.** `deploy/kustomize/scaler.yaml` runs every minute. It queries `rabbitmq_queue_messages{queue="jobs"}` and patches only the `worker` scale subresource. Depth below 2 keeps 1 replica, depth 2 or 3 sets 2, and depth 4 or more sets 3. The floor is 1, so the queue is not left without a consumer. `scripts/scale-from-queue.sh` queued 4 jobs with the worker stopped, the scaler moved the Deployment to 3 replicas, and after the queue drained it returned to 1. The smoke test then passed (`f094d44c-0373-4687-9873-97c00c8a3b76`). `scripts/resilience.sh` also scaled the worker to 2 by hand and jobs still completed.
 
-**Scaling and paging.** Scale workers on queue age once the broker exports it, and keep the floor at one replica. An API autoscaler, if traffic warranted one, should use request rate or in-flight work rather than CPU. Alertmanager would gain a receiver. Logs would go to a store that outlives the pod. The kind node would pull from the registry by digest instead of a side-load.
+The choice of a CronJob, rather than KEDA or a custom-metrics HPA, is the laptop constraint: the API image already has Python, and Prometheus already has the queue series. A second controller would not change the decision. The costs are real. The reaction time is about a minute, plus the mock's processing time. `kubectl apply` writes the manifest baseline of 1 back, and the next run corrects it. This RabbitMQ image exports depth and consumer count once per-object metrics are enabled. It does not export queue age, so an old message sitting behind one slow job looks the same as a short queue. A later scaler should add age and keep the floor at one replica. Prefetch stays 1, so replica count is the parallelism.
+
+#### Enforced NetworkPolicies
+
+**Implemented, and checked.** `deploy/kustomize/networkpolicy.yaml` is default-deny for ingress and egress, then explicit allows: ingress-nginx and Prometheus to the API, the API and worker to RabbitMQ and Redis, the worker to the mock, Prometheus to the metrics ports, Grafana and the scaler to Prometheus, and DNS to `kube-system`. kindnet is the CNI on this cluster, and it does enforce the policies after a short delay. `scripts/check-network.sh` waits, then starts a pod labeled `netcheck`. That pod timed out connecting to Redis. The API, which is allowed, still connected. Kubelet probes are node traffic, and the smoke test still passes through ingress. Creating the policy objects is not the proof. The denied connection is.
+
+kindnet matches API-server traffic after DNAT. The Service is port 443 and the endpoint is port 6443, so a policy that allows only 443 does not let Prometheus or the scaler reach the API server. Both policies allow 6443 as well. A brand-new pod can connect for a moment before kindnet programs the rules, which is why the check sleeps before it tries.
+
+On a production CNI the same default-deny shape applies. The difference is operational: name the CNI, fail a deploy when the enforcement check fails, and treat the API-server allow as a narrow port and namespace rule rather than a blanket cluster egress.
+
+#### External egress
+
+**Proposed for a real provider. The local mock does not need it.** `EXTERNAL_SERVICE_URL` is `http://mock:8081/infer`. The mock is a ClusterIP Service in `takehome`. The worker NetworkPolicy allows that port and DNS, and it does not allow general internet egress. Internet access is not required to run the exercise.
+
+A real inference API would be a hostname outside the cluster. The worker policy would allow egress only to that destination, or to an in-cluster proxy that holds the allow-list, and DNS would stay limited to `kube-system`. An `ExternalName` Service would not replace that rule, because the packet still has to be permitted after DNS resolves. Delivery is at least once, so the outbound call would carry a provider idempotency key. Transport errors, HTTP 429, and 5xx would keep the existing cap of 3 attempts. The mock's `/livez` staying ready while `/infer` returns 503 is the pattern for "the dependency is up and refusing work," and that check would move to the provider's health signal without failing the worker liveness probe.
+
+#### Production identity and TLS
+
+**Proposed.** The running API is HTTP on loopback, with `ssl-redirect` false and no authentication, so the supplied smoke test can call `POST /jobs`. That is acceptable for this exercise and is not a public deployment. RabbitMQ and Redis passwords are random, stored in the `app-credentials` Secret, and generated by Terraform only when the Secret is absent. They also sit in local `terraform.tfstate`, which is gitignored. Application containers run as uid 10001 with a read-only root. That is process hardening, not caller identity.
+
+Production would terminate TLS at the ingress, present a certificate from the platform or cert-manager, and authenticate callers before the request reaches the API. Source ranges would limit who can open `/jobs`. Workload identity would replace long-lived cloud keys if the worker ever called a cloud API. The broker and Redis passwords would come from a secret store that can rotate them, with a planned restart, rather than living in a laptop state file. The application would still receive them as `RABBITMQ_URL` and `REDIS_URL`. Those URLs are not logged.
+
+#### Highly available RabbitMQ and Redis
+
+**Proposed.** Both are single-replica Deployments with `strategy: Recreate` on one kind node. Two pods cannot share the hostPath data directory, and this cluster has nowhere else to place a second replica. The client already reconnects (`RECONNECT_DELAY_SECONDS`) and readiness fails closed when Redis or the broker channel is down, so a restarted pod comes back without the API claiming it is ready. A node loss takes both data sets with it.
+
+A highly available layout needs at least three nodes for a RabbitMQ quorum queue, pod anti-affinity so the members do not land together, and a PodDisruptionBudget once there is more than one pod. Redis would be a replica set with a sentinel or a managed primary, and the API and worker would follow the current primary. Classic mirrored queues are the wrong target on current RabbitMQ. The queue would be declared quorum, and the worker's ack-after-Redis-write behavior would stay, because a replica does not make the Redis write and the ack one transaction. A successful Redis reply in this deployment is not a failover claim.
+
+#### Persistence
+
+**Implemented for a pod restart.** Redis runs with `--appendonly yes` on a hostPath volume. The default `appendfsync` is every second, so a crash can drop the last second of writes. RabbitMQ keeps its data directory on a hostPath volume and uses the stable node name `rabbit@rabbitmq`, so the mnesia directory still matches after the pod name changes. Messages are persistent and the queue is durable. `scripts/persistence.sh` deleted each pod and read the same marker back.
+
+That is pod-delete persistence on one disk. It is not replication, and it is not a guarantee that the Redis reply waited for disk. Publish and the Redis write are still separate, so a crash between them can leave an orphan `queued` record or repeat the mock call. Terminal records expire after `RESULT_TTL_SECONDS` (86400). An expired record makes a later redelivery look new.
+
+#### Backups and recovery
+
+**Proposed.** There is no copy of the data off the kind node. `terraform destroy` and `scripts/cleanup.sh` delete the cluster on purpose, and the hostPath goes with it. A backup would be an AOF or RDB copy taken off the node, plus enough RabbitMQ state to restore the durable queue, stored outside the cluster and encrypted because the payloads include prompts. The honest recovery path for in-flight work is an outbox that can republish, because copying a live mnesia directory from a running node is a poor restore. A recovery drill would restore into an empty cluster, start one worker, and run `scripts/smoke_test.py`. Until that drill exists, the recovery procedure is to recreate the environment and accept that queued jobs on that disk are gone.
+
+#### Rollback
+
+**Implemented for the API image.** `scripts/rollback.sh` sets `devops-takehome-api:does-not-exist`, requires `kubectl rollout status` to fail, runs `kubectl rollout undo`, checks that the image is the previous one, and runs the smoke test (`4ba7ce77-bc60-4c39-9769-460e5a74a8f5`). `maxUnavailable: 0` keeps the previous pods serving during the bad rollout. The same failed rollout fails `scripts/deploy.sh` and the pipeline, so a bad deploy stops before smoke. CI tags images with the 12-character git SHA, which is the revision to roll back to.
+
+`kubectl rollout undo` restores the pod template and does not rewrite `last-applied-configuration`. A later `kubectl apply -k` is what puts the manifest and the live object back in agreement. Undo is the right emergency control for a bad image. The source of truth for a planned rollback is deploying the previous SHA through the same pipeline. A ConfigMap edit is a different failure: the Deployment revision may be unchanged while every new pod sees the new env. Rolling back that change means applying the previous Kustomize tree, then restarting the pods that already loaded it.
+
+#### Cloud shape, not deployed
+
+The same Kustomize tree would run on a managed cluster or a small VM cluster. HostPath would be replaced by a volume that can move between nodes, or by a managed Redis and a managed broker. The ingress would be the platform load balancer with TLS. CI would push the SHA tag to a registry the nodes can pull, by digest, and would drop the kind side-load. Secrets would come from the platform secret manager. NetworkPolicies would stay default-deny, and the pipeline would record which CNI enforced them. None of that is provisioned here, and this repository does not claim a cloud run.
 
 ## Mock controls
 
@@ -272,7 +318,7 @@ State is local, at `deploy/terraform/terraform.tfstate`. It contains the generat
 
 ### Time
 
-Timed implementation on 24 Sep 2026 was about 2 hours, from the API and worker images through the queue scaler (roughly 13:25–15:20 America/Toronto). Tool installs and the first Compose test were before that clock. The architecture and design section was written after that window. Work stayed under the four-hour cap.
+Timed implementation on 24 Sep 2026 was about 2 hours, from the API and worker images through the queue scaler (roughly 13:25–15:20 America/Toronto). Tool installs and the first Compose test were before that clock. The architecture section and the discussion of optional topics were written after that window. Work stayed under the four-hour cap.
 
 Completed: API and worker images, kind deploy, ingress limited to `/jobs`, GitHub Actions pipeline (Jenkinsfile is the same script), Prometheus and Grafana, a check that NetworkPolicy is enforced, worker restart, Terraform recreate and remove, hostPath disks, queue-based worker scaling, alerts, the local registry, and the failure drills.
 
@@ -280,4 +326,4 @@ Next, if more time were available: a second kind node so Redis and RabbitMQ can 
 
 ### Production follow-ups
 
-The design section separates what is running from what is only proposed. The application limits left unchanged are: at-least-once delivery, no shared transaction between Redis and RabbitMQ, result expiry, and no dead-letter queue. The cluster limits left unchanged are: one kind node, hostPath that dies with that node, worker scale from queue depth only, and Alertmanager with no external receiver.
+The discussion section marks each optional topic as implemented or proposed. The application limits left unchanged are: at-least-once delivery, no shared transaction between Redis and RabbitMQ, result expiry, and no dead-letter queue. The cluster limits left unchanged are: one kind node, hostPath that dies with that node, no API HPA, and Alertmanager with no external receiver.
