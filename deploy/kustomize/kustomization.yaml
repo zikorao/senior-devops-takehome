@@ -12,4 +12,6 @@ resources:
   - ingress.yaml
   - networkpolicy.yaml
   - prometheus.yaml
+  - alertmanager.yaml
+  - scaler.yaml
   - grafana.yaml

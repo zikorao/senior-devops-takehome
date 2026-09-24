@@ -13,4 +13,7 @@ fi
 if [[ -f "$ROOT/compose.dependencies.yaml" ]] && docker compose version >/dev/null 2>&1; then
   docker compose -f "$ROOT/compose.dependencies.yaml" down -v
 fi
+if docker container inspect takehome-registry >/dev/null 2>&1; then
+  docker rm -f takehome-registry >/dev/null
+fi
 echo "Removed kind cluster takehome and Compose dependency volumes."

@@ -41,20 +41,21 @@ stage_build() {
 }
 
 stage_push() {
-  local name
+  local name registry
   for name in devops-takehome-api devops-takehome-worker devops-takehome-mock; do
     docker image inspect "${name}:${IMAGE_TAG}" >/dev/null
   done
   if [[ -n "${DOCKER_REGISTRY:-}" ]]; then
-    for name in devops-takehome-api devops-takehome-worker devops-takehome-mock; do
-      docker tag "${name}:${IMAGE_TAG}" "${DOCKER_REGISTRY}/${name}:${IMAGE_TAG}"
-      docker push "${DOCKER_REGISTRY}/${name}:${IMAGE_TAG}"
-    done
-    echo "Pushed ${IMAGE_TAG} to ${DOCKER_REGISTRY}"
-    return 0
+    registry="$DOCKER_REGISTRY"
+  else
+    "$ROOT/scripts/registry.sh"
+    registry="localhost:5001"
   fi
-  echo "DOCKER_REGISTRY is unset. Deploy will load ${IMAGE_TAG} into the kind node."
-  echo "Jenkins uses credential docker-registry to docker login before this stage."
+  for name in devops-takehome-api devops-takehome-worker devops-takehome-mock; do
+    docker tag "${name}:${IMAGE_TAG}" "${registry}/${name}:${IMAGE_TAG}"
+    docker push "${registry}/${name}:${IMAGE_TAG}"
+  done
+  echo "Pushed ${IMAGE_TAG} to ${registry}. Deploy still loads the image into the kind node."
 }
 
 stage_deploy() {

@@ -50,6 +50,7 @@ require_image devops-takehome-mock:1.0.0
 pull_and_load rabbitmq:4.1.4-management
 pull_and_load redis:7.4.5-alpine
 pull_and_load prom/prometheus:v3.5.0
+pull_and_load prom/alertmanager:v0.28.1
 pull_and_load grafana/grafana:12.1.1
 
 if [[ "$IMAGE_TAG" != "local" ]]; then
@@ -98,7 +99,7 @@ fi
 
 kubectl apply -k "$manifests"
 
-for deploy in redis rabbitmq mock api worker prometheus grafana; do
+for deploy in redis rabbitmq mock api worker prometheus alertmanager grafana; do
   kubectl -n "$NS" rollout status "deployment/${deploy}" --timeout=240s
 done
 

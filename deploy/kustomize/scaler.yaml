@@ -1,0 +1,175 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: worker-scaler
+  labels:
+    app.kubernetes.io/name: worker-scaler
+    app.kubernetes.io/part-of: takehome
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: worker-scaler
+  labels:
+    app.kubernetes.io/name: worker-scaler
+    app.kubernetes.io/part-of: takehome
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    resourceNames: ["worker"]
+    verbs: ["get", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: worker-scaler
+  labels:
+    app.kubernetes.io/name: worker-scaler
+    app.kubernetes.io/part-of: takehome
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: worker-scaler
+subjects:
+  - kind: ServiceAccount
+    name: worker-scaler
+    namespace: takehome
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: worker-scaler
+  labels:
+    app.kubernetes.io/name: worker-scaler
+    app.kubernetes.io/part-of: takehome
+data:
+  scale.py: |
+    import json
+    import os
+    import ssl
+    import time
+    import urllib.parse
+    import urllib.request
+
+    PROMETHEUS = os.environ.get("PROMETHEUS_URL", "http://prometheus:9090")
+    NAMESPACE = os.environ["NAMESPACE"]
+    QUERY = 'rabbitmq_queue_messages{queue="jobs"}'
+
+
+    def desired(depth):
+        # One replica drains a short queue. Extra replicas start at 2 and 4 messages.
+        if depth >= 4:
+            return 3
+        if depth >= 2:
+            return 2
+        return 1
+
+
+    def queue_depth():
+        url = PROMETHEUS + "/api/v1/query?" + urllib.parse.urlencode({"query": QUERY})
+        with urllib.request.urlopen(url, timeout=5) as response:
+            body = json.load(response)
+        if body.get("status") != "success":
+            raise SystemExit("prometheus query failed")
+        total = 0.0
+        for series in body["data"]["result"]:
+            total += float(series["value"][1])
+        return total
+
+
+    def scale(replicas):
+        token = open("/var/run/secrets/kubernetes.io/serviceaccount/token", encoding="utf-8").read()
+        context = ssl.create_default_context(
+            cafile="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+        )
+        url = (
+            "https://kubernetes.default.svc/apis/apps/v1/namespaces/"
+            + urllib.parse.quote(NAMESPACE)
+            + "/deployments/worker/scale"
+        )
+        payload = json.dumps({"spec": {"replicas": replicas}}).encode()
+        deadline = time.monotonic() + 30
+        last_error = None
+        while time.monotonic() < deadline:
+            request = urllib.request.Request(url, data=payload, method="PATCH")
+            request.add_header("Authorization", "Bearer " + token)
+            request.add_header("Content-Type", "application/merge-patch+json")
+            request.add_header("Accept", "application/json")
+            try:
+                with urllib.request.urlopen(request, context=context, timeout=5) as response:
+                    response.read()
+                return
+            except Exception as exc:
+                last_error = exc
+                time.sleep(2)
+        raise SystemExit(f"kubernetes api unavailable: {last_error}")
+
+
+    depth = queue_depth()
+    replicas = desired(depth)
+    print(f"queue_depth={depth} replicas={replicas}", flush=True)
+    scale(replicas)
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: worker-scaler
+  labels:
+    app.kubernetes.io/name: worker-scaler
+    app.kubernetes.io/part-of: takehome
+spec:
+  schedule: "* * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 60
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: worker-scaler
+            app.kubernetes.io/part-of: takehome
+        spec:
+          restartPolicy: Never
+          serviceAccountName: worker-scaler
+          automountServiceAccountToken: true
+          enableServiceLinks: false
+          containers:
+            - name: scaler
+              image: devops-takehome-api:local
+              imagePullPolicy: IfNotPresent
+              command: ["python", "/scripts/scale.py"]
+              env:
+                - name: PYTHONDONTWRITEBYTECODE
+                  value: "1"
+                - name: PROMETHEUS_URL
+                  value: http://prometheus:9090
+                - name: NAMESPACE
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace
+              resources:
+                requests:
+                  cpu: 20m
+                  memory: 64Mi
+                limits:
+                  cpu: 200m
+                  memory: 128Mi
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 10001
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+                seccompProfile:
+                  type: RuntimeDefault
+              volumeMounts:
+                - name: script
+                  mountPath: /scripts
+                  readOnly: true
+          volumes:
+            - name: script
+              configMap:
+                name: worker-scaler

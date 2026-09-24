@@ -111,6 +111,14 @@ data:
           "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
           "datasource": {"type": "prometheus", "uid": "prometheus"},
           "targets": [{"expr": "rabbitmq_queue_messages{queue=\"jobs\"}", "refId": "A"}]
+        },
+        {
+          "id": 8,
+          "type": "stat",
+          "title": "Firing alerts",
+          "gridPos": {"h": 4, "w": 6, "x": 0, "y": 24},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "targets": [{"expr": "count(ALERTS{alertstate=\"firing\"}) or vector(0)", "refId": "A"}]
         }
       ]
     }

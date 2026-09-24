@@ -6,6 +6,7 @@ metadata:
     app.kubernetes.io/name: worker
     app.kubernetes.io/part-of: takehome
 spec:
+  # Baseline of 1. deploy/kustomize/scaler.yaml adjusts this from queue depth.
   replicas: 1
   selector:
     matchLabels:

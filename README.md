@@ -119,7 +119,7 @@ submission checklist in the assignment before handing in your repository.
 
 `Jenkinsfile` is the pipeline: checkout, tests, image build, immutable git-SHA tag, push, deploy, and smoke. `.github/workflows/ci.yml` runs the same `scripts/ci-local.sh` on GitHub-hosted runners. That workflow is the executed CI for this repository. A Jenkins run was not claimed.
 
-The script exits non-zero when unit or integration tests fail, a rollout does not become ready, or `scripts/smoke_test.py` fails. With `DOCKER_REGISTRY` unset, the push stage records the immutable tag and the deploy stage loads it into the kind node. A Jenkins agent that should push to a remote registry sets `DOCKER_REGISTRY` and logs in with credential id `docker-registry`.
+The script exits non-zero when unit or integration tests fail, a rollout does not become ready, or `scripts/smoke_test.py` fails. With `DOCKER_REGISTRY` unset, the push stage starts a registry on `127.0.0.1:5001` and pushes the immutable tag there. The deploy stage still loads that image into the kind node, because the node is not configured as a registry mirror. A Jenkins agent that should push to a remote registry sets `DOCKER_REGISTRY` and logs in with credential id `docker-registry`.
 
 The agent needs Git, Python 3.12, Docker with Compose, Terraform 1.5 or newer, kind, kubectl, and network access to pull base images. It also needs a Docker socket and permission to create a local kind cluster. No cloud credentials are required.
 
@@ -134,7 +134,7 @@ Client :8080 -> ingress-nginx /jobs
 
 Recreate and remove the cluster with Terraform. `scripts/cluster-up.sh` and `scripts/deploy.sh` both apply it, and `scripts/cleanup.sh` destroys it. Job traffic is `http://127.0.0.1:8080/jobs`. RabbitMQ, Redis, the mock, the worker, and `/livez`, `/readyz`, and `/metrics` stay on ClusterIP. Ingress checks on 24 Sep 2026 returned nginx 404 for those operational paths and the API JSON body `{"detail":"job not found"}` for an unknown job id.
 
-Liveness is `/livez`. Readiness is `/readyz`. Startup uses `/livez`, so a slow broker does not crash the process. `terminationGracePeriodSeconds` is 30, above the worker's 20-second drain. API and worker set `enableServiceLinks: false`. API starts at 2 replicas with `maxUnavailable: 0`. The worker starts at 1. Redis and RabbitMQ are single-replica Deployments with `emptyDir` and Redis AOF. That survives a container restart only while the pod stays on the node. It is not a backup or a highly available broker.
+Liveness is `/livez`. Readiness is `/readyz`. Startup uses `/livez`, so a slow broker does not crash the process. `terminationGracePeriodSeconds` is 30, above the worker's 20-second drain. API and worker set `enableServiceLinks: false`. API starts at 2 replicas with `maxUnavailable: 0`. The worker starts at 1. Redis and RabbitMQ are single-replica Deployments with a hostPath volume on the kind node, and Redis keeps AOF. `scripts/persistence.sh` deleted each pod and read the same marker back. That survives a pod delete. Deleting the kind node deletes the disk. It is not a backup or a second replica. RabbitMQ uses a fixed node name, `rabbit@rabbitmq`, so the data directory is the same after the pod name changes.
 
 ### Networking and security
 
@@ -152,11 +152,19 @@ Prometheus and Grafana are internal. They are not on the ingress. Prometheus scr
 kubectl -n takehome port-forward svc/grafana 3000:3000
 ```
 
-Open `http://127.0.0.1:3000` and the dashboard Takehome / Takehome jobs. CPU and memory stay on `kubectl top` in `scripts/observe.sh`. Logs stay on `kubectl logs`. Counters reset on process restart; the dashboard uses `rate`. API latency is handler time, not queue-to-result time. Queue age, not CPU, is the useful worker scale signal.
+Open `http://127.0.0.1:3000` and the dashboard Takehome / Takehome jobs. The dashboard includes firing alert count. RabbitMQ exports per-queue series (`prometheus.return_per_object_metrics`). This image does not export queue age, so depth is the queue signal. CPU and memory stay on `kubectl top` in `scripts/observe.sh`. Logs stay on `kubectl logs`. Counters reset on process restart; the dashboard uses `rate`. API latency is handler time, not queue-to-result time.
+
+Prometheus evaluates four rules: `JobsQueueUnconsumed` (no consumers for 45s), `WorkerConsumerDisconnected`, `ApiErrorRatioHigh`, and `JobsQueueBacklog`. Alertmanager is internal and has no external receiver. `scripts/alert-check.sh` stopped the worker and `JobsQueueUnconsumed` fired, then the worker was restored. kindnet matches API-server traffic after DNAT, on endpoint port 6443, so Prometheus and the scaler are allowed that port.
 
 ### Resilience
 
-`scripts/resilience.sh` deleted the worker pod, waited for the replacement, and the smoke test passed (`e8c9b1ba-9978-4afe-8e06-2ef5a519623b`). It then scaled the worker to 2 replicas and the smoke test passed again (`e0ae037d-85b4-4133-970d-cdc8dbc03a69`). The script scales back to 1 so the cluster matches the manifest. Retries on transport errors, HTTP 429, and 5xx stop at `EXTERNAL_MAX_ATTEMPTS` (3). `MOCK_MODE=unavailable` ends new jobs as `failed` / `external_unavailable` while mock `/livez` stays 200. A bad image tag fails `kubectl rollout status`, which fails `scripts/deploy.sh` and the pipeline. Rollback of a pushed SHA is `kubectl rollout undo deployment/api -n takehome`.
+`scripts/resilience.sh` deleted the worker pod, waited for the replacement, and the smoke test passed (`e8c9b1ba-9978-4afe-8e06-2ef5a519623b`). It then scaled the worker to 2 replicas and the smoke test passed again (`e0ae037d-85b4-4133-970d-cdc8dbc03a69`). The script scales back to 1 so the cluster matches the manifest. Retries on transport errors, HTTP 429, and 5xx stop at `EXTERNAL_MAX_ATTEMPTS` (3).
+
+`scripts/dependency-failure.sh` set `MOCK_MODE=unavailable` and restarted the mock. `/livez` stayed ready. Job `3097c7a7-5cd9-4463-887c-95f7e585bc1a` failed with `external_unavailable`. The script restored `normal`, and the smoke test passed (`aad1a678-4655-40a5-9c62-efe8cf0465f7`).
+
+`scripts/rollback.sh` set the API image to `devops-takehome-api:does-not-exist`. The rollout timed out. `kubectl rollout undo` restored `devops-takehome-api:local`, and the smoke test passed (`4ba7ce77-bc60-4c39-9769-460e5a74a8f5`). A bad image tag also fails `kubectl rollout status`, which fails `scripts/deploy.sh` and the pipeline.
+
+`scripts/scale-from-queue.sh` stopped the worker, queued 4 jobs, and the scaler set 3 replicas. After the queue drained it set 1 replica. The smoke test passed (`f094d44c-0373-4687-9873-97c00c8a3b76`). The CronJob runs every minute: 1 replica below 2 messages, 2 replicas at 2 or 3, and 3 at 4 or more. Apply sets the baseline back to 1. The scaler does not scale to zero.
 
 ### Reproducibility
 
@@ -178,10 +186,10 @@ State is local, at `deploy/terraform/terraform.tfstate`. It contains the generat
 
 Timed implementation on 24 Sep 2026 was about 45 minutes, from the API and worker images through this note (roughly 13:25–14:05 America/Toronto). Tool installs and the first Compose test were before that clock. Work stopped under the four-hour cap.
 
-Completed: API and worker images, kind deploy, ingress limited to `/jobs`, GitHub Actions pipeline (Jenkinsfile is the same script), Prometheus and Grafana, worker restart and scale, and a check that NetworkPolicy is enforced. Terraform recreate and remove was added after that timed window.
+Completed in that window: API and worker images, kind deploy, ingress limited to `/jobs`, GitHub Actions pipeline (Jenkinsfile is the same script), Prometheus and Grafana, worker restart and scale, and a check that NetworkPolicy is enforced. Terraform, queue-based worker scaling, hostPath disks, alerts, the local registry, and the failure drills were added after that timed window.
 
-Next, if more time were available: queue-based worker scaling, and durable Redis and RabbitMQ.
+Next, if more time were available: a second kind node so Redis and RabbitMQ can fail off this node, and a backup copied off the node disk.
 
 ### Production follow-ups
 
-API CPU autoscaling would track the wrong signal for this I/O-bound service. Scale workers from queue depth or age. Redis and RabbitMQ need replicated disks, backups, and a restore drill before they are highly available. Publish and the Redis write are not one transaction, and a crash after the mock call can repeat work. Terminal state expires with `RESULT_TTL_SECONDS`. Malformed messages are dropped with no dead-letter queue. Those stay application limits; this deployment does not change them.
+Workers scale from queue depth. This RabbitMQ image does not export queue age. The hostPath volumes survive a pod delete and are gone with the kind node. Publish and the Redis write are not one transaction, and a crash after the mock call can repeat work. Terminal state expires with `RESULT_TTL_SECONDS`. Malformed messages are dropped with no dead-letter queue. Those stay application limits; this deployment does not change them.
