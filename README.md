@@ -150,6 +150,14 @@ Credentials are generated into the `app-credentials` Secret by `scripts/deploy.s
 
 `scripts/resilience.sh` deleted the worker pod, waited for the replacement, and the smoke test passed (`e8c9b1ba-9978-4afe-8e06-2ef5a519623b`). It then scaled the worker to 2 replicas and the smoke test passed again (`e0ae037d-85b4-4133-970d-cdc8dbc03a69`). The script scales back to 1 so the cluster matches the manifest. Retries on transport errors, HTTP 429, and 5xx stop at `EXTERNAL_MAX_ATTEMPTS` (3). `MOCK_MODE=unavailable` ends new jobs as `failed` / `external_unavailable` while mock `/livez` stays 200. A bad image tag fails `kubectl rollout status`, which fails `scripts/deploy.sh` and the pipeline. Rollback of a pushed SHA is `kubectl rollout undo deployment/api -n takehome`.
 
+### Time
+
+Timed implementation on 24 Sep 2026 was about 45 minutes, from the API and worker images through this note (roughly 13:25–14:05 America/Toronto). Tool installs and the first Compose test were before that clock. Work stopped under the four-hour cap.
+
+Completed: API and worker images, kind deploy, ingress limited to `/jobs`, GitHub Actions pipeline (Jenkinsfile is the same script), observability, worker restart and scale, and a kindnet check showing NetworkPolicy is not enforced.
+
+Next, if more time were available: an enforcing CNI, queue-based worker scaling, and durable Redis and RabbitMQ.
+
 ### Production follow-ups
 
 API CPU autoscaling would track the wrong signal for this I/O-bound service. Scale workers from queue depth or age. Redis and RabbitMQ need replicated disks, backups, and a restore drill before they are highly available. Publish and the Redis write are not one transaction, and a crash after the mock call can repeat work. Terminal state expires with `RESULT_TTL_SECONDS`. Malformed messages are dropped with no dead-letter queue. Those stay application limits; this deployment does not change them.
