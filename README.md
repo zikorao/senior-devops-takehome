@@ -114,3 +114,11 @@ docker compose -f compose.dependencies.yaml down -v
 
 You are responsible for documenting cleanup of your own deployment. See the
 submission checklist in the assignment before handing in your repository.
+
+## CI/CD
+
+`Jenkinsfile` is the pipeline: checkout, tests, image build, immutable git-SHA tag, push, deploy, and smoke. `.github/workflows/ci.yml` runs the same `scripts/ci-local.sh` on GitHub-hosted runners. That workflow is the executed CI for this repository. A Jenkins run was not claimed.
+
+The script exits non-zero when unit or integration tests fail, a rollout does not become ready, or `scripts/smoke_test.py` fails. With `DOCKER_REGISTRY` unset, the push stage records the immutable tag and the deploy stage loads it into the kind node. A Jenkins agent that should push to a remote registry sets `DOCKER_REGISTRY` and logs in with credential id `docker-registry`.
+
+The agent needs Git, Python 3.12, Docker with Compose, kind, kubectl, openssl, and network access to pull base images. It also needs a Docker socket and permission to create a local kind cluster. No cloud credentials are required.
