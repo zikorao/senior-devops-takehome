@@ -121,7 +121,7 @@ submission checklist in the assignment before handing in your repository.
 
 The script exits non-zero when unit or integration tests fail, a rollout does not become ready, or `scripts/smoke_test.py` fails. With `DOCKER_REGISTRY` unset, the push stage records the immutable tag and the deploy stage loads it into the kind node. A Jenkins agent that should push to a remote registry sets `DOCKER_REGISTRY` and logs in with credential id `docker-registry`.
 
-The agent needs Git, Python 3.12, Docker with Compose, kind, kubectl, openssl, and network access to pull base images. It also needs a Docker socket and permission to create a local kind cluster. No cloud credentials are required.
+The agent needs Git, Python 3.12, Docker with Compose, Terraform 1.5 or newer, kind, kubectl, and network access to pull base images. It also needs a Docker socket and permission to create a local kind cluster. No cloud credentials are required.
 
 ## Operations
 
@@ -132,7 +132,7 @@ Client :8080 -> ingress-nginx /jobs
                        +-------- redis:6379 -----+
 ```
 
-Bring the cluster up with `scripts/cluster-up.sh`, then `scripts/deploy.sh`. Remove it with `scripts/cleanup.sh`. Job traffic is `http://127.0.0.1:8080/jobs`. RabbitMQ, Redis, the mock, the worker, and `/livez`, `/readyz`, and `/metrics` stay on ClusterIP. Ingress checks on 24 Sep 2026 returned nginx 404 for those operational paths and the API JSON body `{"detail":"job not found"}` for an unknown job id.
+Recreate and remove the cluster with Terraform. `scripts/cluster-up.sh` and `scripts/deploy.sh` both apply it, and `scripts/cleanup.sh` destroys it. Job traffic is `http://127.0.0.1:8080/jobs`. RabbitMQ, Redis, the mock, the worker, and `/livez`, `/readyz`, and `/metrics` stay on ClusterIP. Ingress checks on 24 Sep 2026 returned nginx 404 for those operational paths and the API JSON body `{"detail":"job not found"}` for an unknown job id.
 
 Liveness is `/livez`. Readiness is `/readyz`. Startup uses `/livez`, so a slow broker does not crash the process. `terminationGracePeriodSeconds` is 30, above the worker's 20-second drain. API and worker set `enableServiceLinks: false`. API starts at 2 replicas with `maxUnavailable: 0`. The worker starts at 1. Redis and RabbitMQ are single-replica Deployments with `emptyDir` and Redis AOF. That survives a container restart only while the pod stays on the node. It is not a backup or a highly available broker.
 
@@ -140,7 +140,7 @@ Liveness is `/livez`. Readiness is `/readyz`. Startup uses `/livez`, so a slow b
 
 `deploy/kustomize/networkpolicy.yaml` is default-deny plus allows: ingress-nginx and Prometheus to the API, the API and worker to RabbitMQ and Redis, the worker to the mock, and Prometheus to the metrics ports. DNS egress to `kube-system` is included. kind's CNI is kindnet, and on this cluster it enforces the policies after a short delay. `scripts/check-network.sh` waits, then starts a pod labeled `netcheck`. That pod timed out connecting to Redis, while the API, which is allowed, still can. Kubelet probes are node traffic and the smoke test still passes through ingress.
 
-Credentials are generated into the `app-credentials` Secret by `scripts/deploy.sh` and are not stored in git. `secret.example.yaml` shows the key names only. Application containers run as uid 10001 with a read-only root filesystem. Redis runs as uid 999. The RabbitMQ image starts as root so it can drop to the `rabbitmq` user. The API is unauthenticated. A production ingress would terminate TLS, require authentication, and restrict source networks. A real inference provider would be reached through an allow-listed egress proxy, with an idempotency key, because delivery is at least once.
+Credentials are generated into the `app-credentials` Secret by Terraform the first time the namespace is empty. The values stay in local Terraform state and are not stored in git. `secret.example.yaml` shows the key names only. An existing Secret is left unchanged so a later apply does not rotate passwords under running pods. Application containers run as uid 10001 with a read-only root filesystem. Redis runs as uid 999. The RabbitMQ image starts as root so it can drop to the `rabbitmq` user. The API is unauthenticated. A production ingress would terminate TLS, require authentication, and restrict source networks. A real inference provider would be reached through an allow-listed egress proxy, with an idempotency key, because delivery is at least once.
 
 ### Observability
 
@@ -158,11 +158,27 @@ Open `http://127.0.0.1:3000` and the dashboard Takehome / Takehome jobs. CPU and
 
 `scripts/resilience.sh` deleted the worker pod, waited for the replacement, and the smoke test passed (`e8c9b1ba-9978-4afe-8e06-2ef5a519623b`). It then scaled the worker to 2 replicas and the smoke test passed again (`e0ae037d-85b4-4133-970d-cdc8dbc03a69`). The script scales back to 1 so the cluster matches the manifest. Retries on transport errors, HTTP 429, and 5xx stop at `EXTERNAL_MAX_ATTEMPTS` (3). `MOCK_MODE=unavailable` ends new jobs as `failed` / `external_unavailable` while mock `/livez` stays 200. A bad image tag fails `kubectl rollout status`, which fails `scripts/deploy.sh` and the pipeline. Rollback of a pushed SHA is `kubectl rollout undo deployment/api -n takehome`.
 
+### Reproducibility
+
+Terraform in `deploy/terraform` recreates and removes the local environment. `deploy/kind/cluster.yaml` is the cluster spec. `deploy/kustomize` is the namespace. Apply creates the kind cluster when it is missing, installs ingress-nginx, loads the local app images plus RabbitMQ, Redis, Prometheus, and Grafana, writes `app-credentials` when that Secret is absent, applies the Kustomize tree, and waits until each Deployment is ready. Destroy deletes the kind cluster and the Compose dependency volumes.
+
+Build the API, worker, and mock images first. Then:
+
+```sh
+terraform -chdir=deploy/terraform init
+terraform -chdir=deploy/terraform apply
+terraform -chdir=deploy/terraform destroy
+```
+
+`scripts/cluster-up.sh` and `scripts/deploy.sh` run apply. `scripts/cleanup.sh` runs destroy. CI sets `IMAGE_TAG` to the 12-character git SHA before apply, which selects those image tags. Omit it to use `devops-takehome-api:local`, `devops-takehome-worker:local`, and `devops-takehome-mock:1.0.0`.
+
+State is local, at `deploy/terraform/terraform.tfstate`. It contains the generated passwords. It is gitignored, along with `.terraform/`. Do not commit it. Changing `deploy/kind/cluster.yaml` replaces the cluster. Changing a Kustomize manifest or `TF_VAR_image_tag` reapplies the workloads.
+
 ### Time
 
 Timed implementation on 24 Sep 2026 was about 45 minutes, from the API and worker images through this note (roughly 13:25–14:05 America/Toronto). Tool installs and the first Compose test were before that clock. Work stopped under the four-hour cap.
 
-Completed: API and worker images, kind deploy, ingress limited to `/jobs`, GitHub Actions pipeline (Jenkinsfile is the same script), Prometheus and Grafana, worker restart and scale, and a check that NetworkPolicy is enforced.
+Completed: API and worker images, kind deploy, ingress limited to `/jobs`, GitHub Actions pipeline (Jenkinsfile is the same script), Prometheus and Grafana, worker restart and scale, and a check that NetworkPolicy is enforced. Terraform recreate and remove was added after that timed window.
 
 Next, if more time were available: queue-based worker scaling, and durable Redis and RabbitMQ.
 

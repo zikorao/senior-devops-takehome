@@ -17,13 +17,16 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install kind and kubectl
+      - name: Install kind, kubectl, and terraform
         run: |
           curl -fsSL -o /tmp/kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
           sudo install /tmp/kind /usr/local/bin/kind
           version="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
           curl -fsSL -o /tmp/kubectl "https://dl.k8s.io/release/${version}/bin/linux/amd64/kubectl"
           sudo install /tmp/kubectl /usr/local/bin/kubectl
+          curl -fsSL -o /tmp/terraform.zip https://releases.hashicorp.com/terraform/1.10.3/terraform_1.10.3_linux_amd64.zip
+          sudo unzip -o /tmp/terraform.zip -d /usr/local/bin
+          terraform version
 
       - name: Run pipeline
         run: ./scripts/ci-local.sh

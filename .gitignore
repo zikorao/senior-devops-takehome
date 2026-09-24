@@ -8,3 +8,13 @@ __pycache__/
 .env.*
 !.env.example
 .DS_Store
+
+# Terraform local state holds generated passwords and must not be committed.
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
