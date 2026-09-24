@@ -63,23 +63,111 @@ RabbitMQ AMQP at 5672, RabbitMQ management at 15672; Redis at 6379. Compose publ
 dependency ports only on loopback. Keep these dependencies internal in Kubernetes.
 Read local management credentials from your `.env`; do not include them in your submission.
 
-## Architecture and operational contract
+## Architecture and design
+
+The supplied application is unchanged. This repository adds containers, a local kind cluster, Kustomize workloads, Terraform for create and destroy, and a pipeline that runs the original tests. [APPLICATION.md](APPLICATION.md) is the HTTP contract, the metric names, and the delivery rules. Unit tests do not need running dependencies. Integration tests use a unique queue, start the API and worker in-process, and require the Compose dependencies in the mock's normal mode. The sections below say which of those rules this deployment implements, and which production changes are only described.
+
+### Implemented request path
 
 ```text
-Client -> Ingress -> API -> RabbitMQ -> Worker -> Mock HTTP service
-                     |                   |
-                     +----> Redis <------+
+Client -> Ingress /jobs -> API -> RabbitMQ -> Worker -> Mock /infer
+                            |                   |
+                            +----> Redis <------+
 ```
 
-The API writes initial state and reads results in Redis. The mock represents an
-external service but is bundled and deployed internally for this exercise. Explain
-real external DNS/egress controls in your README; internet egress is not required
-for the local mock.
+```mermaid
+flowchart LR
+  client[Client 127.0.0.1:8080]
+  ingress[ingress-nginx]
+  api[API Deployment]
+  rabbit[RabbitMQ queue jobs]
+  redis[Redis]
+  worker[Worker Deployment]
+  mock[Mock /infer]
+  prom[Prometheus]
+  grafana[Grafana]
+  alerts[Alertmanager]
+  scaler[worker-scaler CronJob]
 
-See [APPLICATION.md](APPLICATION.md) for endpoints, environment configuration,
-metrics, delivery behavior, and known limitations. Unit tests do not need running
-dependencies. Integration tests use a unique queue, start the API/worker in-process,
-and require the real Compose dependencies. Run them in the mock's normal mode.
+  client -->|"POST and GET /jobs"| ingress
+  ingress -->|TCP 8000| api
+  api -->|publish| rabbit
+  api -->|state| redis
+  rabbit -->|consume| worker
+  worker -->|HTTP| mock
+  worker -->|terminal state| redis
+  prom -->|scrape| api
+  prom -->|scrape| worker
+  prom -->|scrape :15692| rabbit
+  grafana --> prom
+  prom --> alerts
+  scaler -->|queue depth| prom
+  scaler -->|patch scale| worker
+```
+
+A client on the laptop reaches only `http://127.0.0.1:8080/jobs`. kind maps host port 8080 to the node port 80, where the ingress-nginx controller listens. The Ingress admits the prefix `/jobs` and sends it to the `api` Service on port 8000. `/livez`, `/readyz`, `/metrics`, OpenAPI, the broker, Redis, the mock, and the worker have no Ingress rule. Checks on 24 Sep 2026 returned nginx 404 for those operational paths.
+
+`POST /jobs` validates the prompt, writes the initial `queued` record in Redis, and publishes a persistent message to the durable queue `jobs` with publisher confirms. The API returns 202 and `job_id` only after both of those succeed. `GET /jobs/{job_id}` reads Redis. It does not call the worker.
+
+The worker prefetches one message. It marks the job `running`, calls `http://mock:8081/infer`, and writes `succeeded` or `failed` before it acknowledges. A redelivered message whose Redis record is already terminal is acknowledged without calling the mock again. Transport errors, HTTP 429, and 5xx are retried up to `EXTERNAL_MAX_ATTEMPTS` (3). The mock process stays ready when `/infer` returns 503, which is how a dependency failure is distinguished from a dead mock.
+
+Cluster DNS resolves `api`, `worker`, `rabbitmq`, `redis`, `mock`, `prometheus`, `grafana`, and `alertmanager` inside the `takehome` namespace. API and worker pods set `enableServiceLinks: false` so Kubernetes does not inject service environment variables beside the `APP_*` port names. The scaler keeps service links off as well and uses its own ServiceAccount to call the API server.
+
+### Implemented workloads
+
+| Workload | Form | Count | Reachable as | State |
+|---|---|---|---|---|
+| API | Deployment, rolling update, `maxUnavailable: 0`, `maxSurge: 1` | 2 | Ingress `/jobs` and ClusterIP `:8000` | Stateless |
+| Worker | Deployment; CronJob adjusts the scale subresource | 1, up to 3 | ClusterIP `:8001` for metrics | Stateless |
+| Mock | Deployment | 1 | ClusterIP `:8081`, worker only | Stateless stand-in for an external API |
+| RabbitMQ 4.1.4 | Deployment, `Recreate`, hostname `rabbitmq` | 1 | ClusterIP 5672, management 15672, metrics 15692 | hostPath, node name `rabbit@rabbitmq` |
+| Redis 7.4.5 | Deployment, `Recreate`, AOF | 1 | ClusterIP `:6379` | hostPath |
+| Prometheus | Deployment | 1 | ClusterIP `:9090` | emptyDir |
+| Grafana | Deployment, anonymous Viewer | 1 | ClusterIP `:3000`, port-forward only | provisioned from a ConfigMap |
+| Alertmanager | Deployment | 1 | ClusterIP `:9093` | emptyDir, no external receiver |
+| worker-scaler | CronJob, every minute, `Forbid` | one job at a time | no Service | reads Prometheus, patches `deployments/worker/scale` |
+
+API and worker containers are `python:3.12.11-slim-bookworm`, installed with `pip --require-hashes`, and run as uid 10001 with a read-only root and an emptyDir at `/tmp`. Requests are 50m CPU and 128Mi; limits are 500m and 256Mi. Startup probes hit `/livez`, so a slow broker does not get the process killed. Readiness is `/readyz` (broker channel and Redis). Liveness is `/livez` and ignores a remote outage. `terminationGracePeriodSeconds` is 30, above the 20-second worker drain. On SIGTERM the worker stops taking new jobs and lets the active job finish. What it does not finish is redelivered.
+
+Non-secret settings live in the `app-config` ConfigMap: queue name, mock URL, timeouts, prefetch 1, and a 24-hour result TTL. `RABBITMQ_URL` and `REDIS_URL` come from the `app-credentials` Secret. Terraform generates those passwords when the Secret is absent and leaves an existing Secret alone, so a later apply does not rotate credentials under running pods. The Secret is not in git. `secret.example.yaml` lists the key names.
+
+### Implemented controls
+
+**Networking.** `deploy/kustomize/networkpolicy.yaml` is default-deny, then explicit allows. ingress-nginx and Prometheus may reach the API on 8000. The API and worker may reach RabbitMQ on 5672 and Redis on 6379. The worker may reach the mock on 8081. Prometheus may scrape the worker on 8001 and RabbitMQ on 15692. Grafana may reach Prometheus. The scaler may reach Prometheus. DNS egress to `kube-system` is allowed. kindnet enforces these policies after a short delay. It matches API-server traffic after DNAT, so Prometheus and the scaler are allowed TCP 6443 as well as 443. `scripts/check-network.sh` shows a pod outside the allow list timing out to Redis while the API still connects.
+
+**Scaling.** The API stays at 2 replicas so one pod can roll without taking `/jobs` down. The worker manifest baseline is 1. The CronJob sets 1 replica when queue depth is below 2, 2 replicas at depth 2 or 3, and 3 at depth 4 or more. It never scales to zero. `kubectl apply` writes the baseline of 1 back; the next minute corrects it. The scaler's Role can patch only the `worker` scale subresource. `scripts/resilience.sh` also shows a manual scale to 2 with jobs still completing.
+
+**Observability.** Prometheus scrapes annotated API and worker pods and the RabbitMQ Prometheus plugin. Per-queue series are on (`prometheus.return_per_object_metrics`). Grafana's Takehome jobs dashboard shows API rate, 5xx ratio, handler-latency p95, worker completions, consumer connection, jobs in progress, queue depth, and firing-alert count. Four rules feed an in-cluster Alertmanager with an empty receiver: no consumers, worker consumer disconnected, API error ratio, and queue depth above 10. CPU, memory, and logs stay in `scripts/observe.sh` (`kubectl top` and `kubectl logs`). Handler latency is not end-to-end job latency. Counters reset when a process restarts; the dashboard uses `rate`.
+
+**Delivery and releases.** Images are tagged with the 12-character git SHA in CI, and with `:local` (mock `:1.0.0`) for a laptop apply. A rollout that does not become ready fails `scripts/deploy.sh` and the pipeline. `scripts/rollback.sh` points the API at a missing tag, watches the rollout time out, and undoes it. `scripts/dependency-failure.sh` sets `MOCK_MODE=unavailable` and expects `external_unavailable` while mock `/livez` stays ready.
+
+**Reproducibility.** `deploy/kind/cluster.yaml` is the one-node kind cluster. `deploy/kustomize` is the namespace. `deploy/terraform` creates the cluster when it is missing, installs ingress-nginx, loads images, applies Kustomize, and waits for rollouts. Destroy deletes the cluster and the Compose volumes. `scripts/cluster-up.sh`, `scripts/deploy.sh`, and `scripts/cleanup.sh` call that Terraform. `Jenkinsfile` is the pipeline definition. `.github/workflows/ci.yml` runs the same `scripts/ci-local.sh` on GitHub-hosted runners and is the CI that has actually run.
+
+**Persistence that is implemented.** Redis AOF and the RabbitMQ data directory sit on hostPath volumes on the kind node. `scripts/persistence.sh` deleted each pod and read the marker back. The fixed RabbitMQ node name keeps the mnesia directory usable after the pod name changes. Deleting the kind node deletes that disk.
+
+### Decisions
+
+kind is the local cluster because the assignment accepts it and no cloud account is required. Kustomize holds the manifests so CI and Terraform apply one tree. Terraform shells out to kind 0.33 instead of a kind provider, because the provider pins an older kind and cannot adopt the cluster that is already running. One node is a laptop budget: Redis and RabbitMQ are single-replica `Recreate` Deployments, not a replicated pair.
+
+Queue depth drives worker replicas because the worker is bound by the mock call, one message at a time. A CPU autoscaler would not see that backlog. The scaler is a CronJob using the API image's Python, not a second controller, so the laptop does not run a metrics adapter. Depth is the signal this RabbitMQ image actually exports. Queue age is not available from it.
+
+The push stage publishes the immutable tag to a local registry on `127.0.0.1:5001` when `DOCKER_REGISTRY` is unset. Deploy still loads the image into the kind node. The node is not a registry mirror. A Jenkins agent with a real registry sets `DOCKER_REGISTRY` and uses credential id `docker-registry`.
+
+### Proposed improvements
+
+These are not deployed. They are the production shape of the same design.
+
+**Edge.** Terminate TLS on the ingress, require authentication, and restrict source networks. The current API is open on loopback so the supplied smoke test can call it.
+
+**Real egress.** The mock is an in-cluster stand-in. A real inference provider would be a separate hostname, reached through an allow-listed egress proxy, with an idempotency key on the provider call. Internet egress is not required for the local mock, and the NetworkPolicy does not grant it. Pods have no general outbound allow.
+
+**Exactly-once submission and execution.** Delivery is at least once. Redis and the publish are not one transaction, so a publish timeout can leave an orphan `queued` record or a 503 after the broker accepted the message. A crash after the mock returns and before the Redis write can repeat the external call. An outbox plus a submission idempotency contract would close the first gap. A provider idempotency key would close the second. Terminal state expires after `RESULT_TTL_SECONDS`, so a message that outlives its Redis record can run again.
+
+**Poison messages.** Malformed messages are rejected without requeue. There is no dead-letter queue. A permanently unavailable dependency becomes `failed` after three attempts and is not retried forever.
+
+**State.** A second kind node, with the data volumes able to move, would let Redis and RabbitMQ survive loss of this node. A backup copied off the node disk would survive deletion of the cluster. Quorum queues and a Redis replica are the availability step after that. A successful Redis reply here is not an fsync or a failover claim.
+
+**Scaling and paging.** Scale workers on queue age once the broker exports it, and keep the floor at one replica. An API autoscaler, if traffic warranted one, should use request rate or in-flight work rather than CPU. Alertmanager would gain a receiver. Logs would go to a store that outlives the pod. The kind node would pull from the registry by digest instead of a side-load.
 
 ## Mock controls
 
@@ -184,7 +272,7 @@ State is local, at `deploy/terraform/terraform.tfstate`. It contains the generat
 
 ### Time
 
-Timed implementation on 24 Sep 2026 was about 2 hours, from the API and worker images through the queue scaler (roughly 13:25–15:20 America/Toronto). Tool installs and the first Compose test were before that clock. Work stayed under the four-hour cap.
+Timed implementation on 24 Sep 2026 was about 2 hours, from the API and worker images through the queue scaler (roughly 13:25–15:20 America/Toronto). Tool installs and the first Compose test were before that clock. The architecture and design section was written after that window. Work stayed under the four-hour cap.
 
 Completed: API and worker images, kind deploy, ingress limited to `/jobs`, GitHub Actions pipeline (Jenkinsfile is the same script), Prometheus and Grafana, a check that NetworkPolicy is enforced, worker restart, Terraform recreate and remove, hostPath disks, queue-based worker scaling, alerts, the local registry, and the failure drills.
 
@@ -192,4 +280,4 @@ Next, if more time were available: a second kind node so Redis and RabbitMQ can 
 
 ### Production follow-ups
 
-Workers scale from queue depth. This RabbitMQ image does not export queue age. The hostPath volumes survive a pod delete and are gone with the kind node. Publish and the Redis write are not one transaction, and a crash after the mock call can repeat work. Terminal state expires with `RESULT_TTL_SECONDS`. Malformed messages are dropped with no dead-letter queue. Those stay application limits; this deployment does not change them.
+The design section separates what is running from what is only proposed. The application limits left unchanged are: at-least-once delivery, no shared transaction between Redis and RabbitMQ, result expiry, and no dead-letter queue. The cluster limits left unchanged are: one kind node, hostPath that dies with that node, worker scale from queue depth only, and Alertmanager with no external receiver.
